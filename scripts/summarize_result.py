@@ -28,9 +28,30 @@ import sys
 
 # 白名单：仅这些键允许出现在摘要中（detail 下的用 "detail.xxx" 表示）
 ALLOWED_TOP = ("status", "action", "points", "balance", "msg")
+# 积分前后对比字段由下方专门的表格渲染，不混进白名单逐项罗列
 ALLOWED_DETAIL = ("streak_days", "today_signed", "domain", "credential",
                   "notify_config_present", "notify_enabled",
                   "notify_success_notify_flag", "notify_success", "notify")
+
+VERDICT_LABEL = {
+    "confirmed_by_delta": "✅ 积分确有增加，本次签到生效",
+    "already_signed_before_run": "⏭️ 今天在本次运行之前已领过，前后积分相同属正常",
+    "check_only_no_claim": "🔍 仅查询模式，未执行领取",
+    "no_increase_observed": "⚠️ 未观察到积分增加，请留意接口是否延迟记账",
+    "balance_unavailable": "⚠️ 接口未给出完整余额，无法用积分变化佐证",
+}
+
+
+def _fmt(v):
+    return "—" if v is None else str(_safe(v))
+
+
+def _fmt_delta(v):
+    if v is None:
+        return "—"
+    if isinstance(v, (int, float)) and v > 0:
+        return "+%s" % v
+    return str(v)
 
 # 兜底：任何长度超过 80 的连续 base64url 风格串都替换为 REDACTED
 LONG_TOKEN_RX = re.compile(r"[A-Za-z0-9_\-]{80,}")
@@ -74,6 +95,25 @@ def build_summary(data):
     for key in ALLOWED_DETAIL:
         if key in detail and detail[key] is not None:
             lines.append("| %s | %s |" % (key, _safe(detail[key])))
+
+    # ── 积分前后对比：直接回答「到底签到了没」──
+    lines.append("")
+    lines.append("## 积分变化（签到前 → 签到后）")
+    lines.append("")
+    lines.append("| 签到前 | 签到后 | 变化 |")
+    lines.append("|---|---|---|")
+    lines.append("| %s | %s | %s |" % (
+        _fmt(data.get("balance_before")),
+        _fmt(data.get("balance_after")),
+        _fmt_delta(data.get("balance_delta"))))
+    lines.append("")
+    verdict = data.get("balance_verdict")
+    head = VERDICT_LABEL.get(verdict)
+    lines.append("> %s" % (head or "判定：%s" % (verdict or "未知")))
+    summary = data.get("balance_summary")
+    if summary:
+        lines.append(">")
+        lines.append("> %s" % _safe(summary))
 
     lines.append("")
     if status == "error":
