@@ -32,6 +32,9 @@ auth.accessToken / auth.refreshToken 不再是明文 JWT，而是 AES-256-GCM �
 其他同步新版的地方：
   - 积分余额字段：新版接口返回复数 total_credits，旧脚本只认单数 total_credit，
     导致 balance 恒为 null —— 本版补齐复数候选名。
+  - 签到前后积分对比：领取前 / 领取后各查一次只读状态接口，输出
+    balance_before / balance_after / balance_delta / balance_verdict /
+    balance_summary，用可验证的数字回答「到底签到了没」，不靠绿灯猜。
   - 日志脱敏收紧：Actions 日志在公开仓库里人人可读，mask_token() 不再回显任何
     字符片段，只报存在性与长度。
 
@@ -112,7 +115,7 @@ STATUS_PATH = "/billing/meter/checkin-activity-status"
 CHECKIN_PATH = "/billing/meter/daily-checkin"
 HTTP_TIMEOUT = 10
 MAX_RETRY = 1
-VERSION = "2.2.0-ci"
+VERSION = "2.3.0-ci"
 
 # 长效令牌刷新端点（插件网关；与桌面客户端刷新所用同一官方接口）
 PLUGIN_API = "https://copilot.tencent.com"
@@ -448,6 +451,78 @@ def _extract_balance(*bodies):
     return None
 
 
+# ── 签到前后积分对比 ──────────────────────────────────────────────
+# 需求：只看「签到成功」四个字无法判断是否真的到账。因此在「领取前」和
+# 「领取后」各查一次只读状态接口，把两次积分余额与差值写进 result.json，
+# 让运行日志 / Step Summary / 本地核验脚本都能直接给出可验证的证据。
+# 额外查询是只读的，失败不影响签到主流程（余额缺失时如实标注，不猜数）。
+
+def _query_balance(base, token, result, tag):
+    """只读查询一次状态接口的积分余额；异常时返回 None 并留下极简标记。"""
+    try:
+        code, body = api_call(base, STATUS_PATH, token)
+        result["detail"]["%s_http" % tag] = code
+        return _extract_balance(body)
+    except Exception as e:
+        # 只记异常类型名，绝不带 URL / 响应体 / 凭据
+        result["detail"]["%s_err" % tag] = type(e).__name__
+        return None
+
+
+def _balance_verdict(before, after, delta, action):
+    """把「到底签到了没」翻译成一个机器可读的结论标签。"""
+    if before is None or after is None:
+        return "balance_unavailable"
+    if delta is None:
+        return "balance_unavailable"
+    if delta > 0:
+        return "confirmed_by_delta"
+    if action == "skip_already_signed":
+        return "already_signed_before_run"
+    if action == "skip_check_only":
+        return "check_only_no_claim"
+    return "no_increase_observed"
+
+
+def _balance_summary(before, after, delta, action, verdict):
+    """生成一句人话，供日志 / 摘要 / 汇报直接引用。"""
+    if verdict == "balance_unavailable":
+        return "积分对比：签到前 %s → 签到后 %s（接口未给出完整余额，无法用积分变化佐证）" % (
+            before, after)
+    if verdict == "confirmed_by_delta":
+        return "积分对比：%s → %s（+%s），本次签到确实到账" % (before, after, delta)
+    if verdict == "already_signed_before_run":
+        return "积分对比：%s → %s（±0）；今天在本次运行之前已领过，余额不变属正常，不是本次没签上" % (
+            before, after)
+    if verdict == "check_only_no_claim":
+        return "积分对比：%s → %s（±0）；仅查询模式，未执行领取" % (before, after)
+    if verdict == "no_increase_observed":
+        return "积分对比：%s → %s（差值 %s）；未观察到积分增加，请留意接口是否延迟记账" % (
+            before, after, delta)
+    return "积分对比：%s → %s" % (before, after)
+
+
+def _finalize_balance(result, before, after):
+    """统一写入前后余额、差值、结论，并把 balance 保持为最终余额（向后兼容）。"""
+    result["balance_before"] = before
+    result["balance_after"] = after
+    if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+        delta = after - before
+    else:
+        delta = None
+    result["balance_delta"] = delta
+    verdict = _balance_verdict(before, after, delta, result.get("action"))
+    result["balance_verdict"] = verdict
+    result["balance_summary"] = _balance_summary(before, after, delta,
+                                                 result.get("action"), verdict)
+    # balance 字段历史含义是「当前余额」，取签到后的值；拿不到则退回签到前
+    final = after if after is not None else before
+    if final is not None:
+        result["balance"] = final
+        result["detail"]["balance"] = final
+    return result
+
+
 # ---------------- 失败推送（微信） ----------------
 
 def load_notify_config():
@@ -702,13 +777,16 @@ def _win_toast(title, body):
 
 def run(check_only):
     result = {"status": "unknown", "action": None, "points": None,
-              "balance": None, "msg": "", "detail": {}}
+              "balance": None, "msg": "", "detail": {},
+              "balance_before": None, "balance_after": None,
+              "balance_delta": None, "balance_verdict": None,
+              "balance_summary": ""}
 
     # 1) 解析凭据（长效令牌 > 短效令牌 > 本机登录态文件）
     token, domain, err = resolve_credential(result)
     if err:
         result.update(status="error", msg=err)
-        return result
+        return _finalize_balance(result, None, None)
     result["detail"]["domain"] = domain
     base = "https://%s/v2" % domain
 
@@ -717,13 +795,12 @@ def run(check_only):
     while attempt <= MAX_RETRY:
         attempt += 1
         try:
-            # 1) 查询今日状态
+            # 1) 签到「前」：查询今日状态，并记下当前积分余额
             st_code, st_body = api_call(base, STATUS_PATH, token)
             result["detail"]["status_http"] = st_code
             result["detail"]["status_resp"] = _resp_for_detail(st_body)
-            # 从状态响应中提前提取积分余额（领取分支会用领取响应再覆盖一次）
-            result["balance"] = _extract_balance(st_body)
-            result["detail"]["balance"] = result["balance"]
+            before = _extract_balance(st_body)
+            result["balance_before"] = before
 
             # 判断是否已签到：兼容多种返回形态
             today_signed = False
@@ -736,19 +813,25 @@ def run(check_only):
                     today_signed = True
 
             if check_only:
-                bal_txt = ("，当前积分余额 %s" % result["balance"]) if result.get("balance") is not None else ""
-                result.update(
-                    status="ok",
-                    action="skip_check_only",
-                    msg="状态查询成功（未执行领取）" + bal_txt,
-                )
+                after = _query_balance(base, token, result, "post_status")
+                if after is None:
+                    after = before
+                result.update(status="ok", action="skip_check_only",
+                              msg="状态查询成功（未执行领取）")
+                _finalize_balance(result, before, after)
+                result["msg"] += "；" + result["balance_summary"]
                 result["detail"]["today_signed"] = today_signed
                 return result
 
             if today_signed:
-                bal_txt = ("，当前积分余额 %s" % result["balance"]) if result.get("balance") is not None else ""
+                # 今天此前已领：仍再查一次，明确显示前后余额相同属正常
+                after = _query_balance(base, token, result, "post_status")
+                if after is None:
+                    after = before
                 result.update(status="ok", action="skip_already_signed",
-                              msg="今日已签到，无需重复领取" + bal_txt)
+                              msg="今日已签到，无需重复领取")
+                _finalize_balance(result, before, after)
+                result["msg"] += "；" + result["balance_summary"]
                 return result
 
             # 2) 领取签到
@@ -762,8 +845,13 @@ def run(check_only):
                 data = ck_body.get("data") if isinstance(ck_body.get("data"), dict) else {}
                 # 已签/重复提示（幂等保护）
                 if code == "10001" or "已签到" in msg or "今天已签到" in msg:
+                    after = _query_balance(base, token, result, "post_status")
+                    if after is None:
+                        after = before
                     result.update(status="ok", action="skip_already_signed",
                                   msg="今日已签到（接口返回 code=10001）")
+                    _finalize_balance(result, before, after)
+                    result["msg"] += "；" + result["balance_summary"]
                     return result
                 # 领取成功判定：HTTP 2xx 且业务码为成功（兼容无 code / code=0 / code=200）
                 success_code = code in ("", "0", "200")
@@ -771,25 +859,34 @@ def run(check_only):
                     credit = (ck_body.get("credit") or data.get("credit")
                               or data.get("daily_credit") or data.get("today_credit"))
                     streak = ck_body.get("streak_days") or data.get("streak_days")
-                    # 领取响应若带回余额则覆盖状态响应中的值
-                    bbal = _extract_balance(ck_body)
-                    if bbal is not None:
-                        result["balance"] = bbal
-                        result["detail"]["balance"] = bbal
-                    bal_txt = ("，当前积分余额 %s" % result["balance"]) if result.get("balance") is not None else ""
-                    result.update(status="ok", action="clicked",
-                                  points=credit,
+                    # 签到「后」：主动再查一次只读状态接口拿最新余额（最可靠）
+                    after = _query_balance(base, token, result, "post_status")
+                    if after is None:
+                        # 接口未回带余额时，退回领取响应里可能带的余额
+                        after = _extract_balance(ck_body)
+                        result["detail"]["balance_after_source"] = "checkin_response"
+                    else:
+                        result["detail"]["balance_after_source"] = "post_status_query"
+                    result.update(status="ok", action="clicked", points=credit,
                                   msg="领取成功" + (("，+%s 积分" % credit) if credit else "") +
-                                      (("，连续第 %s 天" % streak) if streak else "") + bal_txt)
+                                      (("，连续第 %s 天" % streak) if streak else ""))
+                    _finalize_balance(result, before, after)
+                    result["msg"] += "；" + result["balance_summary"]
                     result["detail"]["streak_days"] = streak
                     return result
                 # 其余视为失败（含 2xx 但业务码异常、或非 2xx）
+                after = _query_balance(base, token, result, "post_status")
                 result.update(status="error", action="failed",
                               msg=msg or ("HTTP %s（业务码 %s）" % (ck_code, code)))
+                _finalize_balance(result, before, after)
+                result["msg"] += "；" + result["balance_summary"]
                 return result
             else:
+                after = _query_balance(base, token, result, "post_status")
                 result.update(status="error", action="failed",
                               msg="领取接口返回非 JSON: %s" % ck_body.get("raw", "")[:200])
+                _finalize_balance(result, before, after)
+                result["msg"] += "；" + result["balance_summary"]
                 return result
 
         except urllib.error.HTTPError as e:
@@ -804,6 +901,8 @@ def run(check_only):
             time.sleep(2)
 
     result.update(status="error", msg="重试 %d 次后仍失败: %s" % (MAX_RETRY, last_err))
+    _finalize_balance(result, result.get("balance_before"), None)
+    result["msg"] += "；" + result["balance_summary"]
     return result
 
 
@@ -811,9 +910,11 @@ def write_log(res):
     """把每次运行结果追加写入脚本同目录的 checkin.log（本地核查用，不含 token）。"""
     try:
         log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkin.log")
-        line = "%s | status=%s | action=%s | msg=%s\n" % (
+        line = "%s | status=%s | action=%s | 积分 %s→%s (Δ%s) | %s | msg=%s\n" % (
             time.strftime("%Y-%m-%d %H:%M:%S"),
-            res.get("status"), res.get("action"), res.get("msg"))
+            res.get("status"), res.get("action"),
+            res.get("balance_before"), res.get("balance_after"), res.get("balance_delta"),
+            res.get("balance_verdict"), res.get("msg"))
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(line)
     except Exception:
@@ -984,7 +1085,8 @@ USAGE = (
     "  本机登录态文件     workbuddy-desktop.info（仅明文登录态可用）\n"
     "其他环境变量：WB_DOMAIN / WB_EXPIRES_AT\n"
     "退出码：成功 0 / 失败 1（便于自动化判断是否推送告警）\n"
-    "签到成功后会在结果中展示当前积分余额（若接口返回 balance / total_credits 等字段）。\n"
+    "每次运行会输出「签到前积分 → 签到后积分 → 差值」及判定结论（balance_* 字段），\n"
+    "据此可直接确认积分是否真的到账；接口未返回余额时会如实标注，不猜数。\n"
     "微信推送开关见 ~/.workbuddy/scripts/notify_config.json 的 \"success_notify\" 字段。\n"
 )
 
