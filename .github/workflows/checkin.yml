@@ -106,6 +106,10 @@ jobs:
           echo "checkin_exit_code=$rc" >> "$GITHUB_OUTPUT"
           exit $rc
 
+      - name: 巡检其他积分任务（只读）
+        run: |
+          python scripts/daily_rewards.py --dry-run | tee rewards.json
+
       - name: 输出运行摘要
         if: always()
         # 只输出白名单字段，不把完整 result.json 写入摘要
