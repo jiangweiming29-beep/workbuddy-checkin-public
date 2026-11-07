@@ -160,7 +160,7 @@ def main():
     parser = argparse.ArgumentParser(description="云端巡检并领取其他积分任务")
     parser.add_argument("--dry-run", action="store_true", help="只读，不接受、领取或派出")
     args = parser.parse_args()
-    auth = {}
+    auth = {"detail": {}}
     token, domain, error = resolve_credential(auth)
     if error:
         print(json.dumps({"status": "error", "message": error}, ensure_ascii=False, indent=2))
